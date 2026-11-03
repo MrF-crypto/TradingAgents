@@ -155,8 +155,8 @@ VENDOR_METHODS = {
     "get_prediction_markets": {
         "polymarket": get_polymarket_prediction_markets,
     },
-    # Public Binance market data. No key. The implementation no-ops when the
-    # ticker has no symbol_map entry, so an ordinary ticker never hits the network.
+    # Public Binance market data. No key. Spot symbols come only from
+    # symbol_map. A futures symbol there overrides catalog discovery.
     "get_binance_tradfi_premium": {
         "binance": get_binance_tradfi_premium_report,
     },

@@ -31,11 +31,19 @@ What this module does not know
     The spot and USD-M docs describe ``symbol`` as the exchange's trading
     symbol (their examples are pairs such as BTCUSDT). They do not say which
     symbols, if any, are tokenized US stocks, and they do not say that a stock
-    ticker maps to a symbol by adding a letter. ``contractType`` is an enum on
-    each USD-M symbol (PERPETUAL, CURRENT_MONTH, NEXT_MONTH, CURRENT_QUARTER,
-    NEXT_QUARTER in the connector). A configured futures symbol is treated as a
-    perpetual only when ``exchangeInfo`` returns that symbol with
-    ``contractType`` equal to ``PERPETUAL``.
+    ticker maps to a symbol by adding a letter. ``contractType`` in the USD-M
+    connector enum includes PERPETUAL, CURRENT_MONTH, NEXT_MONTH,
+    CURRENT_QUARTER, and NEXT_QUARTER.
+
+    A live ``GET /fapi/v1/exchangeInfo`` on 2026-11-03 (from a network that is
+    not geo-blocked) returned ``contractType`` ``TRADIFI_PERPETUAL``,
+    ``status`` ``TRADING``, ``underlyingType`` ``EQUITY``, and
+    ``underlyingSubType`` ``["TradFi"]`` for TSLAUSDT, NVDAUSDT, AAPLUSDT, and
+    MUUSDT. ``GET /fapi/v1/fundingRate`` and ``GET /fapi/v1/openInterest``
+    answered for MUUSDT and NVDAUSDT. ``TRADIFI_PERPETUAL`` is therefore
+    treated as a perpetual alongside ``PERPETUAL``. The connector enum above
+    does not list ``TRADIFI_PERPETUAL``; acceptance is from that catalog read,
+    not from a naming rule in the docs.
 """
 
 from __future__ import annotations
@@ -78,6 +86,10 @@ OI_HIST_PERIODS = frozenset({"5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", 
 
 # Intervals published for USD-M klines. Spot also publishes ``1s``, which this
 # client does not request: a second-level pull is not a session comparison.
+# PERPETUAL is the connector enum. TRADIFI_PERPETUAL was observed on
+# 2026-11-03 for USDT-margined equity contracts (underlyingSubType TradFi).
+FUNDING_CONTRACT_TYPES = frozenset({"PERPETUAL", "TRADIFI_PERPETUAL"})
+
 KLINE_INTERVALS = frozenset(
     {
         "1m", "3m", "5m", "15m", "30m",
@@ -260,19 +272,39 @@ def get_futures_klines(
     )
 
 
-def get_futures_contract(symbol: str, *, base_url: str = DEFAULT_FUTURES_BASE) -> dict | None:
-    """The USD-M ``exchangeInfo`` entry for ``symbol``, or None when it is absent.
+def accepts_funding(contract: dict | None) -> bool:
+    """True for contract types that publish funding and open interest.
 
-    ``GET /fapi/v1/exchangeInfo`` takes no symbol parameter in the official
-    connector, so the full catalog is read and filtered locally. Absence is
-    not the same as a perpetual: callers must read ``contractType``.
+    ``PERPETUAL`` is the documented enum value. ``TRADIFI_PERPETUAL`` is
+    included because a 2026-11-03 ``exchangeInfo`` read returned it for
+    TSLAUSDT, NVDAUSDT, AAPLUSDT, and MUUSDT, and funding plus open interest
+    answered for MUUSDT and NVDAUSDT.
+    """
+    return bool(contract) and contract.get("contractType") in FUNDING_CONTRACT_TYPES
+
+
+def get_futures_exchange_info(*, base_url: str = DEFAULT_FUTURES_BASE) -> list[dict]:
+    """Every symbol in ``GET /fapi/v1/exchangeInfo``.
+
+    The official connector takes no symbol filter, so the full catalog is read.
     """
     payload = public_get(base_url, FUTURES_EXCHANGE_INFO_PATH, None)
     if not isinstance(payload, dict):
         raise VendorUnavailableError(f"{FUTURES_EXCHANGE_INFO_PATH} did not return an object")
+    symbols = payload.get("symbols") or []
+    if not isinstance(symbols, list):
+        raise VendorUnavailableError(f"{FUTURES_EXCHANGE_INFO_PATH} symbols was not a list")
+    return [item for item in symbols if isinstance(item, dict)]
+
+
+def get_futures_contract(symbol: str, *, base_url: str = DEFAULT_FUTURES_BASE) -> dict | None:
+    """The USD-M ``exchangeInfo`` entry for ``symbol``, or None when it is absent.
+
+    Absence is not the same as a perpetual: callers must read ``contractType``.
+    """
     wanted = symbol.upper()
-    for item in payload.get("symbols") or []:
-        if isinstance(item, dict) and str(item.get("symbol") or "").upper() == wanted:
+    for item in get_futures_exchange_info(base_url=base_url):
+        if str(item.get("symbol") or "").upper() == wanted:
             return item
     return None
 
@@ -286,7 +318,8 @@ def get_funding_rates(
 ) -> list[dict]:
     """Funding settlements in ``[start_ms, end_ms]``, oldest first.
 
-    Only call this after ``exchangeInfo`` has shown ``contractType`` PERPETUAL.
+    Only call this after ``accepts_funding`` is true (``PERPETUAL`` or
+    ``TRADIFI_PERPETUAL``).
     """
     symbol = symbol.upper()
     rows: list[dict] = []
@@ -450,9 +483,10 @@ def smoke_public(spot_symbol: str = "BTCUSDT", futures_symbol: str | None = None
         f"contractType={contract_type} status={contract.get('status')} "
         f"underlyingType={contract.get('underlyingType')}"
     )
-    if contract_type != "PERPETUAL":
+    if not accepts_funding(contract):
         lines.append(
-            "contractType is not PERPETUAL, so funding and open interest were not requested."
+            "contractType is neither PERPETUAL nor TRADIFI_PERPETUAL, "
+            "so funding and open interest were not requested."
         )
         return "\n".join(lines)
     try:

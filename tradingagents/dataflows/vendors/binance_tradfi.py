@@ -10,11 +10,16 @@ a ticker becomes a symbol by a fixed suffix. Observations from one public read
   klines came back. That is a catalog observation, not a naming rule. Binance
   listing notices have used different spellings for different names (Micron as
   ``MUB``, Tesla as ``TSLAB``), so a suffix must not be assumed.
-- ``https://fapi.binance.com`` returned HTTP 451 from the network that ran that
-  check, so ``contractType`` was not read. USD-M public-data files existed for
-  ``TSLAUSDT`` and ``AAPLUSDT`` klines on 2026-11-01 and not for ``TSLABUSDT``.
-  A kline file does not say ``PERPETUAL``. Funding and open interest are
-  requested only after ``exchangeInfo`` shows ``contractType`` ``PERPETUAL``.
+- An earlier call to ``https://fapi.binance.com`` from a geo-blocked network
+  returned HTTP 451, so that environment could not read ``contractType``.
+  A later live ``GET /fapi/v1/exchangeInfo`` on 2026-11-03 (not geo-blocked)
+  showed TSLAUSDT, NVDAUSDT, AAPLUSDT, and MUUSDT as ``contractType``
+  ``TRADIFI_PERPETUAL``, ``status`` ``TRADING``, ``underlyingType`` ``EQUITY``,
+  ``underlyingSubType`` ``["TradFi"]``. Funding history and open interest
+  answered for MUUSDT and NVDAUSDT. Funding and open interest are requested
+  for ``PERPETUAL`` and for ``TRADIFI_PERPETUAL``. The USD-M connector enum
+  lists ``PERPETUAL`` and not ``TRADIFI_PERPETUAL``; the second value is
+  accepted because that catalog returned it.
 
 ``/sapi/v1/equity/*`` is not called. The official stocks connector marks those
 routes ``MARKET_DATA``, which requires an API key.
@@ -94,6 +99,9 @@ def _settings() -> dict:
         "interval": interval,
         "spot_base_url": str(block.get("spot_base_url") or public.DEFAULT_SPOT_BASE),
         "futures_base_url": str(block.get("futures_base_url") or public.DEFAULT_FUTURES_BASE),
+        # Default on: a ticker with no futures_symbol is looked up in the live
+        # USD-M catalog. Set false to skip that call.
+        "discover_futures": bool(block.get("discover_futures", True)),
     }
 
 
@@ -193,43 +201,184 @@ def _fetch_price_bars(mapping: dict, settings: dict, start_ms: int, end_ms: int)
         return [], "futures", exc
 
 
-def _perpetual(mapping: dict, settings: dict) -> tuple[dict | None, str]:
-    """ExchangeInfo result and a sentence that says what was confirmed.
+def _onboard_ms(contract: dict) -> int | None:
+    """``onboardDate`` in milliseconds, or None when the catalog omits it.
 
-    Funding and open interest are allowed only when the sentence's flag is true.
-    The flag is returned as ``contract['contractType'] == 'PERPETUAL'``.
+    The USD-M exchangeInfo schema includes ``onboardDate``. A missing field is
+    not treated as "listed forever": a historical run will not invent a listing
+    date.
     """
-    symbol = mapping["futures_symbol"]
-    if not symbol:
-        return None, (
-            "No futures symbol is configured, so funding and open interest were not requested. "
-            "Whether a perpetual exists for this name was not looked up."
-        )
+    raw = contract.get("onboardDate")
+    if raw is None or raw == "":
+        return None
     try:
-        contract = public.get_futures_contract(symbol, base_url=settings["futures_base_url"])
-    except VendorError as exc:
-        logger.warning("USD-M exchangeInfo failed for %s: %s", symbol, exc)
-        return None, (
-            f"Perpetual status of {symbol} was NOT confirmed ({exc}). "
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _contract_phrase(contract: dict) -> str:
+    subs = contract.get("underlyingSubType")
+    return (
+        f"{contract.get('symbol')} with contractType {contract.get('contractType')} "
+        f"(status {contract.get('status')}, underlyingType {contract.get('underlyingType')}, "
+        f"underlyingSubType {subs})"
+    )
+
+
+def _funding_decision(contract: dict, end_ms: int, *, historical: bool, explicit: bool) -> tuple[bool, str]:
+    """Whether funding and open interest may be read for this catalog row.
+
+    Rows are still clipped to the analysis window by the caller. A contract
+    whose ``onboardDate`` is after that window is not read at all. An explicit
+    ``futures_symbol`` with no ``onboardDate`` is still read, with that gap
+    stated. Auto-discovery on a historical run requires ``onboardDate``.
+    """
+    if not public.accepts_funding(contract):
+        return False, (
+            f"USD-M `exchangeInfo` lists {_contract_phrase(contract)}, which is "
+            f"neither PERPETUAL nor TRADIFI_PERPETUAL. "
             f"Funding and open interest were not requested."
         )
-    if contract is None:
-        return None, (
-            f"{symbol} is not in USD-M `GET /fapi/v1/exchangeInfo`. "
-            f"That is not a perpetual. Funding and open interest were not requested."
+    onboard = _onboard_ms(contract)
+    if onboard is not None and onboard > end_ms:
+        return False, (
+            f"USD-M `exchangeInfo` lists {_contract_phrase(contract)}, but its "
+            f"onboardDate is after this window. Funding and open interest were not "
+            f"requested, so a later listing is not read into the analysis date."
         )
-    contract_type = contract.get("contractType")
-    status = contract.get("status")
-    if contract_type == "PERPETUAL":
-        return contract, (
-            f"USD-M `exchangeInfo` lists {symbol} with contractType PERPETUAL "
-            f"(status {status}). Funding history and open interest were requested."
+    vintage = ""
+    if onboard is None and historical and explicit:
+        vintage = (
+            " exchangeInfo did not include onboardDate, so the listing vintage was "
+            "not checked; returned rows are still limited to the window."
         )
-    return contract, (
-        f"USD-M `exchangeInfo` lists {symbol} with contractType {contract_type!s} "
-        f"(status {status}), which is not PERPETUAL. "
-        f"Funding and open interest were not requested."
+    elif onboard is None and not historical:
+        vintage = (
+            " onboardDate was absent. The window ends today, so the current catalog "
+            "was used."
+        )
+    return True, (
+        f"USD-M `exchangeInfo` lists {_contract_phrase(contract)}. "
+        f"Funding history and open interest were requested.{vintage}"
     )
+
+
+def discover_tradfi_perpetual(
+    symbols: list, ticker: str, end_ms: int, *, historical: bool
+) -> tuple[dict | None, str]:
+    """Pick one USD-M perpetual for ``ticker`` from a live exchangeInfo catalog.
+
+    A row matches only when ``baseAsset`` equals the ticker, ``underlyingType``
+    is ``EQUITY``, ``underlyingSubType`` contains ``TradFi``, ``status`` is
+    ``TRADING``, and ``contractType`` is ``PERPETUAL`` or ``TRADIFI_PERPETUAL``.
+    Those field values were observed on 2026-11-03 for TSLAUSDT, NVDAUSDT,
+    AAPLUSDT, and MUUSDT. They are not a naming rule from the REST docs.
+    Several matches prefer a single ``USDT`` quote; more than one remaining
+    match is refused. A historical window ignores a row with no ``onboardDate``
+    and a row listed after ``end_ms``.
+    """
+    base = ticker.upper()
+    found = []
+    for item in symbols:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("baseAsset") or "").upper() != base:
+            continue
+        if item.get("underlyingType") != "EQUITY":
+            continue
+        subs = item.get("underlyingSubType") or []
+        if isinstance(subs, str):
+            subs = [subs]
+        if "TradFi" not in subs:
+            continue
+        if item.get("status") != "TRADING":
+            continue
+        if not public.accepts_funding(item):
+            continue
+        found.append(item)
+    usdt = [item for item in found if str(item.get("quoteAsset") or "").upper() == "USDT"]
+    candidates = usdt if usdt else found
+    if not candidates:
+        return None, (
+            f"No USD-M symbol in the current exchangeInfo catalog has baseAsset {base}, "
+            f"underlyingType EQUITY, underlyingSubType TradFi, status TRADING, and "
+            f"contractType PERPETUAL or TRADIFI_PERPETUAL. "
+            f"Funding and open interest were not requested."
+        )
+    if len(candidates) > 1:
+        names = ", ".join(sorted(str(item.get("symbol")) for item in candidates))
+        return None, (
+            f"exchangeInfo has more than one TradFi perpetual for baseAsset {base} "
+            f"({names}). None was selected. Set `futures_symbol` to choose one."
+        )
+    contract = candidates[0]
+    onboard = _onboard_ms(contract)
+    if onboard is not None and onboard > end_ms:
+        return None, (
+            f"The current catalog lists {_contract_phrase(contract)}, but onboardDate "
+            f"is after this window. It was not used."
+        )
+    if onboard is None and historical:
+        return None, (
+            f"The current catalog lists {_contract_phrase(contract)}, but it has no "
+            f"onboardDate. A historical run does not assume that contract existed on "
+            f"the analysis date. Funding and open interest were not requested. "
+            f"Set `futures_symbol` to override."
+        )
+    use, sentence = _funding_decision(contract, end_ms, historical=historical, explicit=False)
+    if not use:
+        return None, sentence
+    return contract, (
+        f"Futures symbol {contract.get('symbol')} was not in `symbol_map`. {sentence} "
+        f"Selection used the live catalog (baseAsset {base}, underlyingType EQUITY, "
+        f"underlyingSubType TradFi), which describes today's listings."
+    )
+
+
+def _resolve_futures(ticker: str, configured: str, settings: dict, end_ms: int, end_date: str):
+    """``(contract or None, futures_symbol, sentence, from_catalog)``.
+
+    An explicit ``futures_symbol`` wins over catalog discovery.
+    """
+    historical = is_historical(end_date)
+    if not configured and not settings["discover_futures"]:
+        return None, "", (
+            "No futures symbol is configured and futures discovery is off, so funding "
+            "and open interest were not requested."
+        ), False
+    try:
+        symbols = public.get_futures_exchange_info(base_url=settings["futures_base_url"])
+    except VendorError as exc:
+        logger.warning("USD-M exchangeInfo failed: %s", exc)
+        if configured:
+            return None, configured, (
+                f"Perpetual status of {configured} was NOT confirmed ({exc}). "
+                f"Funding and open interest were not requested."
+            ), False
+        return None, "", (
+            f"Futures discovery failed ({exc}). "
+            f"Funding and open interest were not requested."
+        ), False
+    if configured:
+        contract = next(
+            (item for item in symbols if str(item.get("symbol") or "").upper() == configured),
+            None,
+        )
+        if contract is None:
+            return None, configured, (
+                f"{configured} is not in USD-M `GET /fapi/v1/exchangeInfo`. "
+                f"Funding and open interest were not requested."
+            ), False
+        use, sentence = _funding_decision(
+            contract, end_ms, historical=historical, explicit=True
+        )
+        return (contract if use else None), configured, sentence, False
+    contract, sentence = discover_tradfi_perpetual(
+        symbols, ticker, end_ms, historical=historical
+    )
+    symbol = str(contract.get("symbol") or "").upper() if contract else ""
+    return contract, symbol, sentence, contract is not None
 
 
 def _labeled(bars, interval: str) -> list[dict]:
@@ -447,15 +596,13 @@ def _render_oi(rows: list[dict], error: str | None, end: date, current: dict | N
 
 
 def get_binance_tradfi_premium(symbol: str, start_date: str, end_date: str) -> str:
-    """Premium/discount of the configured Binance symbol versus the equity close.
+    """Premium/discount of a Binance symbol versus the equity close.
 
-    ``symbol`` is the run's ticker, not a Binance symbol. The Binance symbols
-    come from ``binance_tradfi.symbol_map``.
+    ``symbol`` is the run's ticker, not a Binance symbol. Spot symbols come
+    only from ``binance_tradfi.symbol_map``. A futures symbol in that map wins.
+    Otherwise, when ``discover_futures`` is on, one USD-M contract is taken
+    from the live exchangeInfo catalog.
     """
-    mapping = lookup_mapping(symbol)
-    if mapping is None:
-        return _unmapped(symbol)
-
     settings = _settings()
     if settings["interval"] not in public.KLINE_INTERVALS:
         return (
@@ -463,11 +610,24 @@ def get_binance_tradfi_premium(symbol: str, start_date: str, end_date: str) -> s
             f"kline_interval {settings['interval']!r} is not a documented interval. "
             f"No endpoint was called."
         )
+    configured = lookup_mapping(symbol) or {"spot_symbol": "", "futures_symbol": ""}
+    if not configured["spot_symbol"] and not configured["futures_symbol"] and not settings["discover_futures"]:
+        return _unmapped(symbol)
 
     start_ms, end_ms = window_millis(start_date, end_date)
+    contract, futures_symbol, perpetual_sentence, from_catalog = _resolve_futures(
+        symbol, configured["futures_symbol"], settings, start_ms, end_date
+    )
+    mapping = {"spot_symbol": configured["spot_symbol"], "futures_symbol": futures_symbol}
+    if not mapping["spot_symbol"] and not mapping["futures_symbol"]:
+        return (
+            f"# Binance TradFi for {symbol}\n\n"
+            f"{perpetual_sentence}\n\n"
+            f"No spot symbol is configured, so no premium was computed."
+        )
+
     bars, venue, price_error = _fetch_price_bars(mapping, settings, start_ms, end_ms)
-    contract, perpetual_sentence = _perpetual(mapping, settings)
-    is_perp = bool(contract and contract.get("contractType") == "PERPETUAL")
+    is_perp = contract is not None and public.accepts_funding(contract)
 
     funding: list[dict] = []
     funding_error = None
@@ -475,7 +635,6 @@ def get_binance_tradfi_premium(symbol: str, start_date: str, end_date: str) -> s
     oi_error = None
     current_oi = None
     if is_perp:
-        futures_symbol = mapping["futures_symbol"]
         try:
             funding = public.get_funding_rates(
                 futures_symbol, start_ms, end_ms, base_url=settings["futures_base_url"]
@@ -527,6 +686,15 @@ def get_binance_tradfi_premium(symbol: str, start_date: str, end_date: str) -> s
             f"symbol `{mapping['futures_symbol']}` interval `{settings['interval']}`. "
             f"This is the USD-M contract kline, not a confirmed spot-token price."
         )
+    if from_catalog:
+        origin = (
+            "The futures symbol was selected from the current exchangeInfo catalog, "
+            "not from a documented ticker-to-symbol rule."
+        )
+    elif mapping["futures_symbol"] or mapping["spot_symbol"]:
+        origin = "The symbol was taken from config. It is not a documented ticker-to-symbol rule."
+    else:
+        origin = "No futures symbol was configured or discovered."
 
     lines = [
         f"# Binance TradFi vs underlying for {symbol}",
@@ -536,7 +704,7 @@ def get_binance_tradfi_premium(symbol: str, start_date: str, end_date: str) -> s
         perpetual_sentence,
         "Premium/discount = (Binance close − stock close) / stock close. "
         "Positive means the Binance print is above the stock.",
-        "The symbol was taken from config. It is not a documented ticker-to-symbol rule.",
+        origin,
         "",
     ]
     if price_error is not None:
@@ -562,7 +730,12 @@ def get_binance_tradfi_premium(symbol: str, start_date: str, end_date: str) -> s
         f"`{settings['futures_base_url']}`: `/fapi/v1/klines`, `/fapi/v1/exchangeInfo`, "
         "`/fapi/v1/fundingRate`, `/fapi/v1/openInterest`, `/futures/data/openInterestHist`.",
         "- Funding and open interest are requested only when `exchangeInfo` lists the "
-        "configured futures symbol with `contractType` PERPETUAL.",
+        "futures symbol with `contractType` PERPETUAL or TRADIFI_PERPETUAL. "
+        "TRADIFI_PERPETUAL was observed on 2026-11-03 for TSLAUSDT, NVDAUSDT, "
+        "AAPLUSDT, and MUUSDT (`underlyingType` EQUITY, `underlyingSubType` "
+        "[TradFi]). An explicit `futures_symbol` overrides catalog discovery. "
+        "A historical run does not adopt a discovered contract that lacks "
+        "`onboardDate` or whose `onboardDate` is after the window.",
         "- `/sapi/v1/equity/*` is not called. Those routes require an API key.",
         "- No order, account, or signed endpoint is called.",
         "- Equity closes come from the existing Yahoo path, filtered through the window end.",

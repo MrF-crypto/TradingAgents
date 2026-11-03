@@ -408,9 +408,9 @@ Backtest results are not guaranteed to match any published figure. Returns depen
 
 This fork keeps the upstream Apache-2.0 [`LICENSE`](LICENSE) and Tauric Research copyright. Attribution for the local changes is in [`NOTICE`](NOTICE).
 
-The market analyst can compare a **configured** Binance symbol with the equity close already used by this project (Yahoo). It is a research signal only: public market-data reads, no orders, no account endpoints, and no API keys. A ticker with no entry in `binance_tradfi.symbol_map` does not call Binance, and the other tools are unchanged.
+The market analyst can compare a Binance price with the equity close already used by this project (Yahoo). It is a research signal only: public market-data reads, no orders, no account endpoints, and no API keys. Other tools are unchanged.
 
-The spot and USD-M documents describe a `symbol` parameter. They do not define which symbols are tokenized US stocks, and they do not define a suffix that turns a ticker into one. The map therefore starts empty. Fill it with symbols you have confirmed:
+The spot and USD-M documents describe a `symbol` parameter. They do not define which symbols are tokenized US stocks. Spot symbols are never inferred; set `spot_symbol` yourself. `futures_symbol` overrides discovery. When it is omitted, `discover_futures` (default true) reads the live `GET /fapi/v1/exchangeInfo` catalog and keeps a single row whose `baseAsset` equals the ticker, `underlyingType` is `EQUITY`, `underlyingSubType` contains `TradFi`, `status` is `TRADING`, and `contractType` is `PERPETUAL` or `TRADIFI_PERPETUAL`. On 2026-11-03 a live catalog read showed `TSLAUSDT`, `NVDAUSDT`, `AAPLUSDT`, and `MUUSDT` as `TRADIFI_PERPETUAL` / `TRADING` / `EQUITY` / `["TradFi"]`, and funding plus open interest answered for `MUUSDT` and `NVDAUSDT`. That `contractType` is not in the USD-M connector's older enum, which lists `PERPETUAL`. A historical run does not adopt a discovered contract that has no `onboardDate`, or one whose `onboardDate` is after the window. Set `discover_futures` to false to skip the catalog call.
 
 ```python
 config = {
@@ -422,7 +422,7 @@ config = {
 }
 ```
 
-`spot_symbol` is read with `GET /api/v3/klines` on `https://data-api.binance.vision`. `futures_symbol` is read with `GET /fapi/v1/klines` on `https://fapi.binance.com`. Funding history and open interest are requested only when `GET /fapi/v1/exchangeInfo` lists that symbol with `contractType` `PERPETUAL`. A name in the example above is a placeholder, not a listing.
+`spot_symbol` is read with `GET /api/v3/klines` on `https://data-api.binance.vision`. `futures_symbol` is read with `GET /fapi/v1/klines` on `https://fapi.binance.com`. Funding history (`GET /fapi/v1/fundingRate`) and open interest are requested for `PERPETUAL` and `TRADIFI_PERPETUAL`. A name in the example above is a placeholder, not a listing.
 
 Check the public endpoints with no LLM key:
 

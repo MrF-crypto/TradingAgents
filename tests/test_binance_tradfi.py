@@ -2,7 +2,7 @@
 
 The default symbol map is empty. A normal ticker must not call Binance.
 Funding and open interest are requested only after exchangeInfo reports
-contractType PERPETUAL.
+contractType PERPETUAL or TRADIFI_PERPETUAL.
 """
 
 from __future__ import annotations
@@ -71,6 +71,7 @@ def _map(**overrides):
         "kline_interval": "1h",
         "spot_base_url": SPOT,
         "futures_base_url": FUTURES,
+        "discover_futures": False,
     }
     block.update(overrides)
     set_config({"binance_tradfi": block})
@@ -122,9 +123,11 @@ class TestCashSession:
 
 @pytest.mark.unit
 class TestMapping:
-    def test_default_map_is_empty_and_calls_nothing(self):
+    def test_discovery_off_does_not_call_binance(self):
+        set_config({"binance_tradfi": {"discover_futures": False, "symbol_map": {}}})
+
         def refuse(*_a, **_k):
-            raise AssertionError("Binance was called for an unmapped ticker")
+            raise AssertionError("Binance was called while discovery is off and the map is empty")
 
         with mock.patch.object(public.requests, "get", refuse), \
                 mock.patch.object(tradfi, "load_ohlcv", refuse):
@@ -321,7 +324,7 @@ class TestPerpetualGate:
         paths = [url for url, _ in calls]
         assert not any(url.endswith("/fapi/v1/fundingRate") for url in paths)
         assert not any("openInterest" in url for url in paths)
-        assert "not PERPETUAL" in out
+        assert "neither PERPETUAL nor TRADIFI_PERPETUAL" in out
         assert "+100.00%" in out
 
     def test_a_restricted_futures_host_does_not_confirm_a_perpetual(self, monkeypatch):
@@ -392,3 +395,194 @@ class TestRouting:
     def test_a_normal_ticker_still_uses_the_equity_vendor(self):
         _map(symbol_map={})
         assert router.get_vendor("core_stock_apis", "get_stock_data") == "yfinance"
+
+
+def _tradfi_row(symbol, base, **extra):
+    """Field shape observed on 2026-11-03 for USDT-margined equity perps."""
+    row = {
+        "symbol": symbol,
+        "contractType": "TRADIFI_PERPETUAL",
+        "status": "TRADING",
+        "underlyingType": "EQUITY",
+        "underlyingSubType": ["TradFi"],
+        "baseAsset": base,
+        "quoteAsset": "USDT",
+        "onboardDate": _ms(2026, 1, 28, 0),
+    }
+    row.update(extra)
+    return row
+
+
+_CATALOG = [
+    _tradfi_row("TSLAUSDT", "TSLA"),
+    _tradfi_row("NVDAUSDT", "NVDA"),
+    _tradfi_row("AAPLUSDT", "AAPL"),
+    _tradfi_row("MUUSDT", "MU"),
+    {
+        "symbol": "BTCUSDT",
+        "contractType": "PERPETUAL",
+        "status": "TRADING",
+        "underlyingType": "COIN",
+        "underlyingSubType": ["PoW"],
+        "baseAsset": "BTC",
+        "quoteAsset": "USDT",
+    },
+]
+
+
+@pytest.mark.unit
+class TestTradFiDiscovery:
+    def test_observed_rows_match_their_base_asset(self):
+        end = _ms(2026, 7, 5, 0)
+        for symbol, base in (("TSLAUSDT", "TSLA"), ("NVDAUSDT", "NVDA"), ("AAPLUSDT", "AAPL"), ("MUUSDT", "MU")):
+            found, sentence = tradfi.discover_tradfi_perpetual(
+                _CATALOG, base, end, historical=True
+            )
+            assert found["symbol"] == symbol
+            assert found["contractType"] == "TRADIFI_PERPETUAL"
+            assert "TRADIFI_PERPETUAL" in sentence
+        # A crypto perpetual is not a TradFi equity, even when the base matches.
+        none, sentence = tradfi.discover_tradfi_perpetual(_CATALOG, "BTC", end, historical=True)
+        assert none is None
+        assert "No USD-M symbol" in sentence
+
+    def test_a_historical_row_without_onboard_date_is_not_assumed(self):
+        catalog = [_tradfi_row("MUUSDT", "MU", onboardDate=None)]
+        found, sentence = tradfi.discover_tradfi_perpetual(
+            catalog, "MU", _ms(2026, 7, 5, 0), historical=True
+        )
+        assert found is None
+        assert "onboardDate" in sentence
+        assert "does not assume" in sentence
+
+    def test_a_contract_listed_after_the_window_is_not_used(self):
+        catalog = [_tradfi_row("MUUSDT", "MU", onboardDate=_ms(2026, 12, 1, 0))]
+        found, sentence = tradfi.discover_tradfi_perpetual(
+            catalog, "MU", _ms(2026, 7, 5, 0), historical=True
+        )
+        assert found is None
+        assert "after this window" in sentence
+
+    def test_two_usdt_matches_are_not_guessed(self):
+        catalog = [
+            _tradfi_row("MUUSDT", "MU"),
+            _tradfi_row("MU2USDT", "MU"),
+        ]
+        found, sentence = tradfi.discover_tradfi_perpetual(
+            catalog, "MU", _ms(2026, 7, 5, 0), historical=False
+        )
+        assert found is None
+        assert "MU2USDT" in sentence and "MUUSDT" in sentence
+
+    def test_discovered_tradifi_perpetual_requests_funding_and_open_interest(self, monkeypatch):
+        set_config({
+            "binance_tradfi": {
+                "symbol_map": {},
+                "discover_futures": True,
+                "kline_interval": "1h",
+                "spot_base_url": SPOT,
+                "futures_base_url": FUTURES,
+            }
+        })
+        monkeypatch.setattr(tradfi, "load_ohlcv", lambda *a, **k: _stock_frame())
+        monkeypatch.setattr(tradfi, "is_historical", lambda _day: True)
+        calls = []
+
+        def fake_get(url, params=None, timeout=None):
+            calls.append((url, params))
+            if url.endswith("/fapi/v1/exchangeInfo"):
+                return _response(200, {"symbols": _CATALOG})
+            if url.endswith("/fapi/v1/klines"):
+                assert params["symbol"] == "MUUSDT"
+                return _response(200, [_kline(_ms(2026, 7, 2, 15), "870")])
+            if url.endswith("/fapi/v1/fundingRate"):
+                assert params["symbol"] == "MUUSDT"
+                return _response(200, [{
+                    "symbol": "MUUSDT",
+                    "fundingRate": "0.00037717",
+                    "fundingTime": _ms(2026, 7, 2, 16),
+                    "markPrice": "874.63",
+                }])
+            if url.endswith("/futures/data/openInterestHist"):
+                return _response(200, [{
+                    "symbol": "MUUSDT",
+                    "sumOpenInterest": "165656.12",
+                    "sumOpenInterestValue": "1",
+                    "timestamp": _ms(2026, 7, 2, 15),
+                }])
+            if url.endswith("/fapi/v1/openInterest"):
+                raise AssertionError("present open interest is withheld for a historical window")
+            raise AssertionError(url)
+
+        with mock.patch.object(public.requests, "get", fake_get):
+            out = tradfi.get_binance_tradfi_premium("MU", "2026-07-02", "2026-07-04")
+        assert "TRADIFI_PERPETUAL" in out
+        assert "0.00037717" in out
+        assert "874.63" in out
+        assert "165656.12" in out
+        assert "selected from the current exchangeInfo catalog" in out
+        assert any(url.endswith("/fapi/v1/fundingRate") for url, _ in calls)
+
+    def test_an_explicit_futures_symbol_overrides_discovery(self, monkeypatch):
+        _map(symbol_map={"MU": {"futures_symbol": "NVDAUSDT"}}, discover_futures=True)
+        monkeypatch.setattr(tradfi, "load_ohlcv", lambda *a, **k: _stock_frame())
+        monkeypatch.setattr(tradfi, "is_historical", lambda _day: False)
+        calls = []
+
+        def fake_get(url, params=None, timeout=None):
+            calls.append((url, params or {}))
+            if url.endswith("/fapi/v1/exchangeInfo"):
+                return _response(200, {"symbols": _CATALOG})
+            if url.endswith("/fapi/v1/klines"):
+                return _response(200, [_kline(_ms(2026, 7, 2, 15), "200")])
+            if url.endswith("/fapi/v1/fundingRate"):
+                return _response(200, [{
+                    "symbol": params["symbol"],
+                    "fundingRate": "0.00010480",
+                    "fundingTime": _ms(2026, 7, 2, 16),
+                    "markPrice": "204.05",
+                }])
+            if url.endswith("/futures/data/openInterestHist"):
+                return _response(200, [])
+            if url.endswith("/fapi/v1/openInterest"):
+                assert params["symbol"] == "NVDAUSDT"
+                return _response(200, {
+                    "symbol": "NVDAUSDT", "openInterest": "347156.24", "time": _ms(2026, 7, 2, 16),
+                })
+            raise AssertionError(url)
+
+        with mock.patch.object(public.requests, "get", fake_get):
+            out = tradfi.get_binance_tradfi_premium("MU", "2026-07-02", "2026-07-04")
+        funding = [params for url, params in calls if url.endswith("/fapi/v1/fundingRate")]
+        assert [params["symbol"] for params in funding] == ["NVDAUSDT"]
+        assert all(params.get("symbol") != "MUUSDT" for _url, params in calls)
+        assert "0.00010480" in out
+        assert "347156.24" in out
+        assert "204.05" in out
+        assert "taken from config" in out
+
+    def test_documented_perpetual_is_still_accepted(self, monkeypatch):
+        _map(symbol_map={"BTC": {"futures_symbol": "BTCUSDT"}})
+        monkeypatch.setattr(tradfi, "load_ohlcv", lambda *a, **k: _stock_frame())
+        monkeypatch.setattr(tradfi, "is_historical", lambda _day: True)
+
+        def fake_get(url, params=None, timeout=None):
+            if url.endswith("/fapi/v1/exchangeInfo"):
+                return _response(200, {"symbols": _CATALOG})
+            if url.endswith("/fapi/v1/klines"):
+                return _response(200, [_kline(_ms(2026, 7, 2, 15), "100")])
+            if url.endswith("/fapi/v1/fundingRate"):
+                return _response(200, [{
+                    "symbol": "BTCUSDT",
+                    "fundingRate": "0.00010000",
+                    "fundingTime": _ms(2026, 7, 2, 16),
+                    "markPrice": "1",
+                }])
+            if url.endswith("/futures/data/openInterestHist"):
+                return _response(200, [])
+            raise AssertionError(url)
+
+        with mock.patch.object(public.requests, "get", fake_get):
+            out = tradfi.get_binance_tradfi_premium("BTC", "2026-07-02", "2026-07-04")
+        assert "contractType PERPETUAL" in out
+        assert "0.00010000" in out

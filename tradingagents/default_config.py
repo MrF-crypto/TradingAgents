@@ -164,8 +164,9 @@ def build_default_config() -> dict:
             "news_data": "yfinance",             # Options: alpha_vantage, yfinance
             "macro_data": "fred",                # Options: fred (needs FRED_API_KEY)
             "prediction_markets": "polymarket",  # Options: polymarket (keyless)
-            # Public Binance market data for a configured symbol map. Keyless.
-            # Options: binance. An empty symbol_map does not call Binance.
+            # Public Binance market data. Keyless. Options: binance.
+            # An empty symbol_map still consults USD-M exchangeInfo when
+            # discover_futures is on.
             "binance_tradfi": "binance",
         },
         # Tool-level configuration (takes precedence over category-level)
@@ -205,15 +206,18 @@ def build_default_config() -> dict:
             ".SA":  "^BVSP",       # B3 Brazil (Ibovespa)
             "":     "SPY",         # default for US-listed tickers (no suffix)
         },
-        # Binance tokenized-stock research. ``symbol_map`` is empty on purpose:
-        # the spot and USD-M docs do not define which symbols are tokenized US
-        # stocks, so a ticker is compared only when you set the symbols.
-        # A string value is a spot symbol. A dict may set ``spot_symbol`` and
-        # ``futures_symbol`` (USD-M). Funding and open interest are fetched
-        # only after exchangeInfo reports contractType PERPETUAL.
-        # Example (not a listing): {"AAPL": {"spot_symbol": "<SPOT>", "futures_symbol": "<USD-M>"}}
+        # Binance tokenized-stock research. Spot symbols are never inferred.
+        # ``futures_symbol`` in ``symbol_map`` overrides catalog discovery.
+        # When it is omitted and ``discover_futures`` is true, one USD-M
+        # contract is taken from the live exchangeInfo catalog: baseAsset
+        # equals the ticker, underlyingType EQUITY, underlyingSubType TradFi,
+        # status TRADING, contractType PERPETUAL or TRADIFI_PERPETUAL.
+        # TRADIFI_PERPETUAL was observed on 2026-11-03 for TSLAUSDT, NVDAUSDT,
+        # AAPLUSDT, and MUUSDT. A historical run does not adopt a discovered
+        # contract with no onboardDate, or one listed after the window.
         "binance_tradfi": {
             "symbol_map": {},
+            "discover_futures": True,
             "kline_interval": "1h",
             "spot_base_url": "https://data-api.binance.vision",
             "futures_base_url": "https://fapi.binance.com",

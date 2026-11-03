@@ -302,15 +302,19 @@ def get_binance_tradfi_premium(
     Compare a configured Binance symbol with the underlying equity close.
 
     Research signal only. Uses public, unauthenticated Binance market data
-    (no API key, no order, no account endpoint). The Binance symbols come from
-    config ``binance_tradfi.symbol_map``; this tool does not invent a ticker
-    mapping. When the ticker is not in that map, no Binance request is made.
+    (no API key, no order, no account endpoint). Spot symbols come only from
+    config ``binance_tradfi.symbol_map``. A ``futures_symbol`` in that map
+    overrides catalog discovery. Otherwise one USD-M contract may be selected
+    from the live exchangeInfo catalog (baseAsset equals the ticker,
+    underlyingType EQUITY, underlyingSubType TradFi). Funding and open
+    interest are requested only for contractType PERPETUAL or
+    TRADIFI_PERPETUAL. TRADIFI_PERPETUAL was observed on 2026-11-03 for
+    USDT-margined equity contracts such as TSLAUSDT and NVDAUSDT.
 
     Returns the premium or discount versus the stock close, flags bars that
     open while the US cash session is closed (weekend, full-day holiday, or
-    outside 09:30-16:00 America/New_York), and, only when USD-M exchangeInfo
-    lists the configured futures symbol as PERPETUAL, funding-rate history and
-    open interest.
+    outside 09:30-16:00 America/New_York), and, when a perpetual is confirmed
+    for this window, funding-rate history and open interest.
 
     Args:
         start_date (str): Start date in yyyy-mm-dd format
