@@ -404,6 +404,32 @@ What does not vary anymore: the analyzed company identity is resolved determinis
 
 Backtest results are not guaranteed to match any published figure. Returns depend on the model, the temperature, the date range, data quality, and the sampling above. Treat the framework as a research scaffold for studying multi-agent analysis, not as a strategy with a fixed, replicable return.
 
+## Fork modifications
+
+This fork keeps the upstream Apache-2.0 [`LICENSE`](LICENSE) and Tauric Research copyright. Attribution for the local changes is in [`NOTICE`](NOTICE).
+
+The market analyst can compare a **configured** Binance symbol with the equity close already used by this project (Yahoo). It is a research signal only: public market-data reads, no orders, no account endpoints, and no API keys. A ticker with no entry in `binance_tradfi.symbol_map` does not call Binance, and the other tools are unchanged.
+
+The spot and USD-M documents describe a `symbol` parameter. They do not define which symbols are tokenized US stocks, and they do not define a suffix that turns a ticker into one. The map therefore starts empty. Fill it with symbols you have confirmed:
+
+```python
+config = {
+    "binance_tradfi": {
+        "symbol_map": {
+            "AAPL": {"spot_symbol": "<SPOT_SYMBOL>", "futures_symbol": "<USD_M_SYMBOL>"},
+        }
+    }
+}
+```
+
+`spot_symbol` is read with `GET /api/v3/klines` on `https://data-api.binance.vision`. `futures_symbol` is read with `GET /fapi/v1/klines` on `https://fapi.binance.com`. Funding history and open interest are requested only when `GET /fapi/v1/exchangeInfo` lists that symbol with `contractType` `PERPETUAL`. A name in the example above is a placeholder, not a listing.
+
+Check the public endpoints with no LLM key:
+
+```bash
+python -c "from tradingagents.dataflows.vendors.binance_public import smoke_public; print(smoke_public())"
+```
+
 ## Contributing
 
 Contributions are welcome: bug fixes, documentation, and feature ideas; past contributions are credited per release in [`CHANGELOG.md`](CHANGELOG.md).

@@ -17,6 +17,9 @@ from tradingagents.dataflows.vendors.alpha_vantage import (
     get_news as get_alpha_vantage_news,
     get_stock as get_alpha_vantage_stock,
 )
+from tradingagents.dataflows.vendors.binance_tradfi import (
+    get_binance_tradfi_premium as get_binance_tradfi_premium_report,
+)
 from tradingagents.dataflows.vendors.fred import get_macro_data as get_fred_macro_data
 from tradingagents.dataflows.vendors.polymarket import (
     get_prediction_markets as get_polymarket_prediction_markets,
@@ -83,7 +86,13 @@ TOOLS_CATEGORIES = {
         "tools": [
             "get_prediction_markets",
         ]
-    }
+    },
+    "binance_tradfi": {
+        "description": "Configured Binance token price versus the underlying equity",
+        "tools": [
+            "get_binance_tradfi_premium",
+        ]
+    },
 }
 
 # Optional enrichment categories. These add macro/event context to the news
@@ -91,7 +100,7 @@ TOOLS_CATEGORIES = {
 # sentinel instead of aborting the run (a bad LLM-supplied indicator, a missing
 # key, or a network blip should not crash an analysis over flavour data). Core
 # categories (prices, fundamentals, news) still raise so a broken primary is loud.
-OPTIONAL_CATEGORIES = {"macro_data", "prediction_markets"}
+OPTIONAL_CATEGORIES = {"macro_data", "prediction_markets", "binance_tradfi"}
 
 # Mapping of methods to their vendor-specific implementations
 VENDOR_METHODS = {
@@ -145,6 +154,11 @@ VENDOR_METHODS = {
     # prediction_markets
     "get_prediction_markets": {
         "polymarket": get_polymarket_prediction_markets,
+    },
+    # Public Binance market data. No key. The implementation no-ops when the
+    # ticker has no symbol_map entry, so an ordinary ticker never hits the network.
+    "get_binance_tradfi_premium": {
+        "binance": get_binance_tradfi_premium_report,
     },
 }
 

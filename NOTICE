@@ -1,0 +1,12 @@
+TradingAgents
+Copyright 2024-2026 Tauric Research
+
+This product includes software developed by Tauric Research
+(https://github.com/TauricResearch/TradingAgents), licensed under the
+Apache License, Version 2.0. The upstream LICENSE file is unchanged.
+
+Modifications in this distribution, on branch feat/binance-tradfi:
+a research-only reader of Binance's public, unauthenticated market-data
+endpoints, and a market-analyst comparison of a configured Binance symbol
+with the existing equity price. It does not place orders, call account
+endpoints, or use an API key.

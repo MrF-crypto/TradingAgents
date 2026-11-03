@@ -289,3 +289,38 @@ def get_prediction_markets(
         str: A formatted markdown report of matching prediction markets
     """
     return route_to_vendor("get_prediction_markets", topic, limit, trade_date or None)
+
+
+@tool
+def get_binance_tradfi_premium(
+    symbol: Annotated[str, InjectedState("company_of_interest")],
+    start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
+    end_date: Annotated[str, "End date in yyyy-mm-dd format"],
+    trade_date: Annotated[str, InjectedState("trade_date")] = "",
+) -> str:
+    """
+    Compare a configured Binance symbol with the underlying equity close.
+
+    Research signal only. Uses public, unauthenticated Binance market data
+    (no API key, no order, no account endpoint). The Binance symbols come from
+    config ``binance_tradfi.symbol_map``; this tool does not invent a ticker
+    mapping. When the ticker is not in that map, no Binance request is made.
+
+    Returns the premium or discount versus the stock close, flags bars that
+    open while the US cash session is closed (weekend, full-day holiday, or
+    outside 09:30-16:00 America/New_York), and, only when USD-M exchangeInfo
+    lists the configured futures symbol as PERPETUAL, funding-rate history and
+    open interest.
+
+    Args:
+        start_date (str): Start date in yyyy-mm-dd format
+        end_date (str): End date in yyyy-mm-dd format
+
+    Returns:
+        str: A markdown comparison, or a notice that no symbol is configured.
+    """
+    try:
+        start_date, end_date = as_of_window(start_date, end_date, trade_date)
+    except ValueError as exc:
+        return str(exc)
+    return route_to_vendor("get_binance_tradfi_premium", symbol, start_date, end_date)

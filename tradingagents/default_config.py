@@ -164,6 +164,9 @@ def build_default_config() -> dict:
             "news_data": "yfinance",             # Options: alpha_vantage, yfinance
             "macro_data": "fred",                # Options: fred (needs FRED_API_KEY)
             "prediction_markets": "polymarket",  # Options: polymarket (keyless)
+            # Public Binance market data for a configured symbol map. Keyless.
+            # Options: binance. An empty symbol_map does not call Binance.
+            "binance_tradfi": "binance",
         },
         # Tool-level configuration (takes precedence over category-level)
         "tool_vendors": {
@@ -201,6 +204,19 @@ def build_default_config() -> dict:
             ".SZ":  "399001.SZ",   # Shenzhen (SZSE Component)
             ".SA":  "^BVSP",       # B3 Brazil (Ibovespa)
             "":     "SPY",         # default for US-listed tickers (no suffix)
+        },
+        # Binance tokenized-stock research. ``symbol_map`` is empty on purpose:
+        # the spot and USD-M docs do not define which symbols are tokenized US
+        # stocks, so a ticker is compared only when you set the symbols.
+        # A string value is a spot symbol. A dict may set ``spot_symbol`` and
+        # ``futures_symbol`` (USD-M). Funding and open interest are fetched
+        # only after exchangeInfo reports contractType PERPETUAL.
+        # Example (not a listing): {"AAPL": {"spot_symbol": "<SPOT>", "futures_symbol": "<USD-M>"}}
+        "binance_tradfi": {
+            "symbol_map": {},
+            "kline_interval": "1h",
+            "spot_base_url": "https://data-api.binance.vision",
+            "futures_base_url": "https://fapi.binance.com",
         },
 
     })
